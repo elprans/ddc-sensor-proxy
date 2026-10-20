@@ -1,0 +1,24 @@
+[Unit]
+Description=DDC/CI monitor ambient light sensor (net.hadess.SensorProxy)
+Conflicts=iio-sensor-proxy.service
+
+[Service]
+Type=dbus
+BusName=net.hadess.SensorProxy
+# Development: run the script straight from the working tree.
+ExecStart=/usr/bin/python3 /home/elvis/dev/hw/ddc-sensor-proxy/ddc-sensor-proxy --model U4025QW
+Restart=on-failure
+RestartSec=5
+
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateNetwork=yes
+NoNewPrivileges=yes
+DevicePolicy=closed
+DeviceAllow=char-i2c rw
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=graphical.target

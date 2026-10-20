@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+"""Expose a monitor's DDC/CI ambient light sensor as net.hadess.SensorProxy.
+
+KWin (and anything else that speaks iio-sensor-proxy's D-Bus API) picks the
+reading up as a regular ambient light sensor.  Only the light sensor part of
+the interface is implemented; accelerometer and proximity always report
+"not present".
+
+The Dell U4025QW reports its sensor in VCP 0x67 while auto-brightness
+(VCP 0x66 == 0x82) is enabled; the reading keeps working in HDR mode, where
+the OSD greys the option out.
+"""
+
+import argparse
+import fcntl
+import logging
+import os
+import pathlib
+import time
+
+import dbus
+import dbus.service
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
+
+BUS_NAME = "net.hadess.SensorProxy"
+OBJECT_PATH = "/net/hadess/SensorProxy"
+IFACE = "net.hadess.SensorProxy"
+PROPS_IFACE = "org.freedesktop.DBus.Properties"
+
+I2C_SLAVE = 0x0703
+DDC_ADDR = 0x37
+
+log = logging.getLogger("ddc-sensor-proxy")
+
+
+def edid_model(edid: bytes) -> str | None:
+    for off in (54, 72, 90, 108):
+        desc = edid[off:off + 18]
+        if len(desc) == 18 and desc[:3] == b"\0\0\0" and desc[3] == 0xFC:
+            return desc[5:].split(b"\n")[0].decode("ascii", "replace").strip()
+    return None
+
+
+def find_i2c_bus(model: str) -> str | None:
+    """Return /dev/i2c-N of the connected DRM connector whose EDID name contains model."""
+    for conn in sorted(pathlib.Path("/sys/class/drm").glob("card*-*")):
+        try:
+            if (conn / "status").read_text().strip() != "connected":
+                continue
+            name = edid_model((conn / "edid").read_bytes())
+        except OSError:
+            continue
+        if not name or model not in name:
+            continue
+        # DP connectors carry their AUX i2c adapter as a child; HDMI/DVI use the ddc link.
+        candidates = sorted(conn.glob("i2c-*"))
+        if not candidates and (conn / "ddc").exists():
+            candidates = [(conn / "ddc").resolve()]
+        if candidates:
+            return f"/dev/{candidates[0].name}"
+    return None
+
+
+class DDC:
+    def __init__(self, dev: str):
+        self.dev = dev
+        self.fd = os.open(dev, os.O_RDWR)
+        fcntl.ioctl(self.fd, I2C_SLAVE, DDC_ADDR)
+
+    def close(self):
+        os.close(self.fd)
+
+    def get_vcp(self, code: int, retries: int = 4) -> tuple[int, int]:
+        """Return (current, max) for a VCP feature."""
+        req = bytes([0x51, 0x82, 0x01, code])
+        chk = 0x6E
+        for b in req:
+            chk ^= b
+        req += bytes([chk])
+        err: Exception | None = None
+        for _ in range(retries):
+            try:
+                os.write(self.fd, req)
+                time.sleep(0.05)
+                resp = os.read(self.fd, 11)
+                rchk = 0x50
+                for b in resp[:10]:
+                    rchk ^= b
+                if (len(resp) != 11 or resp[1] != 0x88 or resp[2] != 0x02
+                        or resp[4] != code or rchk != resp[10]):
+                    raise OSError(f"bad DDC reply {resp.hex()}")
+                if resp[3] != 0:
+                    raise OSError(f"VCP 0x{code:02x} unsupported")
+                return (resp[8] << 8) | resp[9], (resp[6] << 8) | resp[7]
+            except OSError as e:
+                err = e
+                time.sleep(0.1)
+        raise err
+
+
+class SensorProxy(dbus.service.Object):
+    def __init__(self, bus, args):
+        super().__init__(bus, OBJECT_PATH)
+        self.args = args
+        self.ddc: DDC | None = None
+        self.claims: dict[str, object] = {}
+        self.timer: int | None = None
+        self.props = {
+            "HasAccelerometer": dbus.Boolean(False),
+            "AccelerometerOrientation": dbus.String("undefined"),
+            "AccelerometerTilt": dbus.String("undefined"),
+            "HasAmbientLight": dbus.Boolean(False),
+            "LightLevelUnit": dbus.String("lux"),
+            "LightLevel": dbus.Double(0.0),
+            "HasProximity": dbus.Boolean(False),
+            "ProximityNear": dbus.Boolean(False),
+        }
+        self.poll()  # determine HasAmbientLight up front
+        # Keep HasAmbientLight current even when nobody has claimed the sensor.
+        GLib.timeout_add_seconds(30, self._idle_check)
+
+    # --- sensor ---
+
+    def _read(self) -> float | None:
+        if self.ddc is None:
+            dev = self.args.device or find_i2c_bus(self.args.model)
+            if dev is None:
+                log.debug("monitor %r not connected", self.args.model)
+                return None
+            try:
+                self.ddc = DDC(dev)
+                log.info("using %s", dev)
+            except OSError as e:
+                log.warning("cannot open %s: %s", dev, e)
+                return None
+        try:
+            enabled, _ = self.ddc.get_vcp(self.args.enable_vcp)
+            if enabled & 0x7F != 0x02:
+                log.debug("sensor disabled (VCP 0x%02x = 0x%02x)", self.args.enable_vcp, enabled)
+                return None
+            raw, _ = self.ddc.get_vcp(self.args.vcp)
+        except OSError as e:
+            log.warning("DDC read failed: %s", e)
+            self.ddc.close()
+            self.ddc = None
+            return None
+        return max(0.0, (raw - self.args.offset) * self.args.scale)
+
+    def poll(self) -> bool:
+        lux = self._read()
+        changed = {}
+        has = lux is not None
+        if bool(self.props["HasAmbientLight"]) != has:
+            self.props["HasAmbientLight"] = dbus.Boolean(has)
+            changed["HasAmbientLight"] = self.props["HasAmbientLight"]
+        if has and float(self.props["LightLevel"]) != lux:
+            self.props["LightLevel"] = dbus.Double(lux)
+            changed["LightLevel"] = self.props["LightLevel"]
+            log.debug("light level %s", lux)
+        if changed:
+            self.PropertiesChanged(IFACE, changed, [])
+        return True
+
+    def _idle_check(self) -> bool:
+        if not self.claims:
+            self.poll()
+        return True
+
+    def _update_polling(self):
+        if self.claims and self.timer is None:
+            self.poll()
+            self.timer = GLib.timeout_add(int(self.args.interval * 1000), self.poll)
+        elif not self.claims and self.timer is not None:
+            GLib.source_remove(self.timer)
+            self.timer = None
+
+    # --- net.hadess.SensorProxy ---
+
+    @dbus.service.method(IFACE, sender_keyword="sender")
+    def ClaimLight(self, sender=None):
+        if sender not in self.claims:
+            def gone(owner, name=sender):
+                if not owner:
+                    self._release(name)
+            self.claims[sender] = self.connection.watch_name_owner(sender, gone)
+            log.info("light claimed by %s", sender)
+        self._update_polling()
+
+    @dbus.service.method(IFACE, sender_keyword="sender")
+    def ReleaseLight(self, sender=None):
+        self._release(sender)
+
+    def _release(self, sender):
+        watch = self.claims.pop(sender, None)
+        if watch is not None:
+            watch.cancel()
+            log.info("light released by %s", sender)
+        self._update_polling()
+
+    @dbus.service.method(IFACE)
+    def ClaimAccelerometer(self):
+        pass
+
+    @dbus.service.method(IFACE)
+    def ReleaseAccelerometer(self):
+        pass
+
+    @dbus.service.method(IFACE)
+    def ClaimProximity(self):
+        pass
+
+    @dbus.service.method(IFACE)
+    def ReleaseProximity(self):
+        pass
+
+    # --- org.freedesktop.DBus.Properties ---
+
+    @dbus.service.method(PROPS_IFACE, in_signature="ss", out_signature="v")
+    def Get(self, iface, prop):
+        if iface != IFACE or prop not in self.props:
+            raise dbus.exceptions.DBusException(
+                f"No such property {iface}.{prop}",
+                name="org.freedesktop.DBus.Error.InvalidArgs")
+        return self.props[prop]
+
+    @dbus.service.method(PROPS_IFACE, in_signature="s", out_signature="a{sv}")
+    def GetAll(self, iface):
+        return self.props if iface == IFACE else {}
+
+    @dbus.service.method(PROPS_IFACE, in_signature="ssv")
+    def Set(self, iface, prop, value):
+        raise dbus.exceptions.DBusException(
+            "Properties are read-only",
+            name="org.freedesktop.DBus.Error.PropertyReadOnly")
+
+    @dbus.service.signal(PROPS_IFACE, signature="sa{sv}as")
+    def PropertiesChanged(self, iface, changed, invalidated):
+        pass
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--model", default="U4025QW",
+                   help="substring of the monitor's EDID name (default: %(default)s)")
+    p.add_argument("--device", help="i2c device to use instead of looking up --model")
+    p.add_argument("--vcp", type=lambda s: int(s, 0), default=0x67,
+                   help="VCP code holding the sensor reading (default: 0x67)")
+    p.add_argument("--enable-vcp", type=lambda s: int(s, 0), default=0x66,
+                   help="VCP code of the sensor on/off switch (default: 0x66)")
+    p.add_argument("--offset", type=float, default=0.0,
+                   help="subtract from the raw reading (default: %(default)s)")
+    p.add_argument("--scale", type=float, default=1.0,
+                   help="multiply the offset reading to get lux (default: %(default)s)")
+    p.add_argument("--interval", type=float, default=2.0,
+                   help="poll interval in seconds while claimed (default: %(default)s)")
+    p.add_argument("--session", action="store_true",
+                   help="use the session bus (for testing)")
+    p.add_argument("-v", "--verbose", action="store_true")
+    args = p.parse_args()
+
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        format="%(levelname)s: %(message)s")
+
+    DBusGMainLoop(set_as_default=True)
+    bus = dbus.SessionBus() if args.session else dbus.SystemBus()
+    name = dbus.service.BusName(BUS_NAME, bus, do_not_queue=True)  # noqa: F841
+    SensorProxy(bus, args)
+    GLib.MainLoop().run()
+
+
+if __name__ == "__main__":
+    main()

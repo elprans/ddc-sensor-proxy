@@ -5,10 +5,12 @@ Conflicts=iio-sensor-proxy.service
 [Service]
 Type=dbus
 BusName=net.hadess.SensorProxy
-# Development: run the script straight from the working tree.
-ExecStart=/usr/bin/python3 /home/elvis/dev/hw/ddc-sensor-proxy/ddc-sensor-proxy --model U4025QW
+# Development: run the binary straight from the working tree (cargo build --release).
+ExecStart=/home/elvis/dev/hw/ddc-sensor-proxy/target/release/ddc-sensor-proxy --model U4025QW
 Restart=on-failure
 RestartSec=5
+# Let the kernel batch our timer wakeups with others.
+TimerSlackNSec=50ms
 
 ProtectSystem=strict
 ProtectHome=read-only
@@ -18,7 +20,8 @@ NoNewPrivileges=yes
 DevicePolicy=closed
 DeviceAllow=char-i2c rw
 CapabilityBoundingSet=
-RestrictAddressFamilies=AF_UNIX
+# AF_NETLINK for DRM hotplug uevents.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
 
 [Install]
 WantedBy=graphical.target

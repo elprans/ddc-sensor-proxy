@@ -1,0 +1,20 @@
+[package]
+name = "ddc-sensor-proxy"
+version = "0.2.0"
+edition = "2024"
+description = "Expose a monitor's DDC/CI ambient light sensor as net.hadess.SensorProxy"
+license = "MIT"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+env_logger = { version = "0.11", default-features = false }
+futures-util = { version = "0.3", default-features = false }
+libc = "0.2"
+log = "0.4"
+tokio = { version = "1", features = ["rt", "macros", "time", "net", "sync"] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

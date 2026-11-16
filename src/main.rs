@@ -192,6 +192,8 @@ struct Sensor {
     args: Args,
     ddc: Option<Ddc>,
     enable_checked: Option<Instant>,
+    /// Whether we already told the user that auto-brightness is off.
+    warned_off: bool,
 }
 
 impl Sensor {
@@ -234,9 +236,25 @@ impl Sensor {
         if self.enable_checked.is_none_or(|t| t.elapsed() >= ENABLE_RECHECK) {
             let (enabled, _) = ddc.get_vcp(self.args.enable_vcp).await?;
             if enabled & 0x7F != 0x02 {
-                debug!("sensor disabled (VCP 0x{:02x} = 0x{enabled:02x})", self.args.enable_vcp);
+                let msg = format!("sensor disabled (VCP 0x{:02x} = 0x{enabled:02x})", self.args.enable_vcp);
+                if self.warned_off {
+                    debug!("{msg}");
+                } else {
+                    // Switching it back on over DDC while in HDR mode sets the flag but
+                    // leaves the reading frozen; the monitor only starts sampling when
+                    // auto-brightness is on as it enters HDR.
+                    warn!(
+                        "{msg}: turn on the monitor's auto-brightness with HDR off, \
+                         then re-enable HDR"
+                    );
+                    self.warned_off = true;
+                }
                 self.enable_checked = None;
                 return Ok(None);
+            }
+            if self.warned_off {
+                info!("sensor enabled");
+                self.warned_off = false;
             }
             self.enable_checked = Some(Instant::now());
         }
@@ -477,7 +495,7 @@ async fn main() -> zbus::Result<()> {
         .init();
 
     let session = args.session;
-    let mut sensor = Sensor { args, ddc: None, enable_checked: None };
+    let mut sensor = Sensor { args, ddc: None, enable_checked: None, warned_off: false };
     // Determine HasAmbientLight before taking the bus name.
     let lux = sensor.read().await;
 

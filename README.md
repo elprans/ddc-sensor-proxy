@@ -14,7 +14,14 @@ so the two can't run at the same time.
 
 Developed against the Dell U4025QW, which reports its sensor in VCP `0x67`
 while auto-brightness (VCP `0x66` == `0x82`) is enabled.  The reading keeps
-working in HDR mode, where the OSD greys the option out.  Other monitors
+working in HDR mode, where the OSD greys the option out.
+
+The sensor only samples in HDR mode if auto-brightness was on when the
+monitor entered HDR.  Turning it on over DDC (or finding it off, which the
+daemon warns about) while already in HDR leaves the reading frozen; turn
+auto-brightness on with HDR off, then re-enable HDR.
+
+Other monitors
 with a DDC/CI light sensor should work with the right `--vcp`,
 `--enable-vcp`, `--offset` and `--scale`.
 

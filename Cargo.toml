@@ -1,7 +1,9 @@
 [package]
 name = "ddc-sensor-proxy"
-version = "0.2.0"
+version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+repository = "https://github.com/elprans/ddc-sensor-proxy"
 description = "Expose a monitor's DDC/CI ambient light sensor as net.hadess.SensorProxy"
 license = "MIT"
 

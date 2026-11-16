@@ -5,8 +5,7 @@ Conflicts=iio-sensor-proxy.service
 [Service]
 Type=dbus
 BusName=net.hadess.SensorProxy
-# Development: run the binary straight from the working tree (cargo build --release).
-ExecStart=/home/elvis/dev/hw/ddc-sensor-proxy/target/release/ddc-sensor-proxy --model U4025QW
+ExecStart=/usr/bin/ddc-sensor-proxy --model U4025QW
 Restart=on-failure
 RestartSec=5
 # Let the kernel batch our timer wakeups with others.
